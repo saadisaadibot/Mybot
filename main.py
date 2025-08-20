@@ -215,10 +215,10 @@ def _update_state_and_check(symbol, bid, ask, bqty, aqty):
     mid = (bid + ask) / 2.0
     spread_bp = (ask - bid) / mid * 10000.0
 
-    # فلتر سبريد/سيولة أولي
+    # فلتر سبريد/سيولة أولي (شدّ السبريد)
     bid_usdt = bqty * bid
     ask_usdt = aqty * ask
-    if spread_bp > SPREAD_MAX_BP: 
+    if spread_bp > 25.0:   # ← بدل 35.0
         _reject(f"spread {spread_bp:.1f}bp", symbol); 
         return False, {}
     if bid_usdt < MIN_BID_USDT: 
@@ -247,7 +247,6 @@ def _update_state_and_check(symbol, bid, ask, bqty, aqty):
 
     # حساب داخل النافذة
     q = st["q"]
-    # اجمع upticks حقيقية داخل النافذة (بالرجوع عبر q)
     b_prev = None; upt_in_win = 0
     for ts, b, a, BQ, AQ, m in list(q)[::-1]:
         if now - ts > WINDOW_SEC: break
@@ -263,18 +262,17 @@ def _update_state_and_check(symbol, bid, ask, bqty, aqty):
     if m_old and mid:
         slope_bp = (mid - m_old) / ((mid + m_old)/2.0) * 10000.0
 
-    # شرط الاستدامة (تشغيل/إيقاف)
+    # شرط الاستدامة (تشغيل/إيقاف) — صار AND بدل OR
     press_ok = st["ewma_pressure"] >= PRESSURE_TRIG
-    slope_ok = slope_bp >= MID_SLOPE_MIN_BP and upt_in_win >= UPTICKS_MIN
+    slope_or_ticks_ok = (slope_bp >= MID_SLOPE_MIN_BP) or (upt_in_win >= UPTICKS_MIN)
 
-    if press_ok or slope_ok:
+    if press_ok and slope_or_ticks_ok:
         if st["sustain_start"] == 0.0:
             st["sustain_start"] = now
         sustained = (now - st["sustain_start"]) >= SUSTAIN_SEC
     else:
         st["sustain_start"] = 0.0
         sustained = False
-        # هستريسز: لا نعيد التفعيل إلا بعد ما ينخفض الضغط كفاية
         if st["ewma_pressure"] < PRESSURE_CLEAR:
             pass
 
@@ -288,7 +286,6 @@ def _update_state_and_check(symbol, bid, ask, bqty, aqty):
         "slope_bp": slope_bp
     }
     return sustained, metrics
-
 def on_message(ws, message):
     try:
         data = json.loads(message)
