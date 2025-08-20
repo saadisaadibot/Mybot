@@ -13,7 +13,7 @@ SAQAR_WEBHOOK   = "https://saadisaadibot-saqarxbo-production.up.railway.app/"
 # اختيار ديناميكي من Bitvavo (فريم 15m + 5m)
 TOP_15M             = 5
 TOP_5M              = 5
-MIN_EUR_VOL_24H     = 50_000.0
+MIN_EUR_VOL_24H     = 10_000.0
 CANDLES_LIMIT       = 20
 EXCLUDE_BASES       = {"EUR", "USDT", "USDC"}
 
