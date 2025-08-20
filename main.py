@@ -266,7 +266,7 @@ def _update_state_and_check(symbol, bid, ask, bqty, aqty):
     press_ok = st["ewma_pressure"] >= PRESSURE_TRIG
     trend_ok = (slope_bp >= MID_SLOPE_MIN_BP) and (upt_in_win >= UPTICKS_MIN)
 
-    if press_ok and slope_or_ticks_ok:
+    if press_ok and trend_ok:
         if st["sustain_start"] == 0.0:
             st["sustain_start"] = now
         sustained = (now - st["sustain_start"]) >= SUSTAIN_SEC
