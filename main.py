@@ -30,12 +30,12 @@ SUSTAIN_SEC         = 1.5        # لازم الشروط تبقى ≥ العتب
 
 # فلاتر سيولة/سبريد
 SPREAD_MAX_BP       = 35.0       # أقصى سبريد (bp)
-MIN_BID_USDT        = 800.0      # حد أدنى سيولة على أفضل Bid
+MIN_BID_USDT        = 1200.0      # حد أدنى سيولة على أفضل Bid
 IMB_MIN             = 1.25       # تفوق bids/asks الأدنى المقبول
 
 # ضغط المشترين (EWMA)
 PRESSURE_ALPHA      = 0.35       # نعومة EWMA
-PRESSURE_TRIG       = 0.35       # عتبة إطلاق: ((bid-ask)/(bid+ask))_EWMA
+PRESSURE_TRIG       = 0.50       # عتبة إطلاق: ((bid-ask)/(bid+ask))_EWMA
 PRESSURE_CLEAR      = 0.20       # لتفريغ الإشارة (hysteresis)
 
 # اتجاه سعري قصير جداً
