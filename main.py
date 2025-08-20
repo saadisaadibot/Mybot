@@ -1,172 +1,346 @@
-# main.py — Gap Sniper (Binance → Saqar) — gunicorn-friendly
-import os, time, json, threading, traceback, requests
-from collections import defaultdict, deque
+# -*- coding: utf-8 -*-
+import json, time, math, threading, traceback
+import requests
+from collections import deque, defaultdict
+from websocket import WebSocketApp
 from flask import Flask
 
-# ===== إعدادات عامة =====
-PORT               = int(os.getenv("PORT", "8080"))
-SAQAR_URL          = os.getenv("SAQAR_URL", "https://saqar.example.com/hook")  # عدّل لعنوان «صقر»
-SAQAR_TOKEN        = os.getenv("SAQAR_TOKEN", "")                              # اتركه فارغ إذا مو لازم
+# =========================
+# إعدادات ثابتة (لا .env)
+# =========================
+SAQAR_WEBHOOK   = "https://saadisaadibot-saqarxbo-production.up.railway.app/"  # <-- جاهز
+TOP_N           = 10             # كم عملة EUR من Bitvavo نفحص
+GAP_SPREAD_BP   = 30.0           # حد الفجوة بالـ basis points (30 = 0.30%)
+COOLDOWN_SEC    = 45             # كولداون لكل عملة قبل إرسال إشارة جديدة
+SCAN_INTERVAL   = 180            # كل كم ثانية نعيد جلب قائمة Bitvavo EUR
 
-BITVAVO_MARKETS_URL= "https://api.bitvavo.com/v2/markets"
-BINANCE_REST_EXINF = "https://api.binance.com/api/v3/exchangeInfo"
-BIN_WS_URL         = "wss://stream.binance.com:9443/stream?streams="
+# فلاتر إضافية (تقدر تعدّلها براحتك)
+SUSTAIN_SEC         = 1.20       # لازم السبريد يبقى ≥ الحد لمدة X ثوانٍ
+MIN_TOP_QTY_USDT    = 1200.0     # حد أدنى للسيولة عند أفضل Bid/Ask (بالدولار التقريبي)
+USE_IMBALANCE       = True       # فلتر انحياز دفتر أوامر؟
+IMB_RATIO_MIN       = 1.6        # (max(bid_usdt, ask_usdt) / min(...)) ≥ 1.6
 
-# ===== تحكم بالإشعارات =====
-MIN_SPREAD_BP              = 45.0       # أدنى فجوة (basis points) = 0.45%
-CONFIRM_TICKS              = 3          # تأكيد عبر 3 تيكات
-PER_SYMBOL_COOLDOWN_SEC    = 120        # تبريد لكل رمز
-GLOBAL_MIN_INTERVAL_SEC    = 1.5        # ريت ليمت عام
-MIN_BID_QTY_USDT           = 300.0      # سيولة أدنى على الـ bid
-MIN_ASK_QTY_USDT           = 300.0      # سيولة أدنى على الـ ask
-MIN_NOTIONAL_USDT          = 10.0
-HEARTBEAT_SEC              = 30         # طباعة “أنا شغّال” كل 30s
-VERBOSE                    = True
+# إزالة تكرار + سقف الرسايل
+DEDUP_WINDOW_SEC    = 4.0        # نفس التنبيه لنفس الزوج خلال 4s
+MAX_ALERTS_PER_MIN  = 12         # سقف التنبيهات بالدقيقة
+DEBUG_REJECTIONS    = True       # اطبع سبب الرفض في اللوج
 
+# =========================
+# متغيرات داخلية
+# =========================
 app = Flask(__name__)
-def log(*a): print(*a, flush=True)
+_binance_symbols_ok = set()          # من exchangeInfo
+_targets_lock = threading.Lock()
+_targets      = set()                # أمثلة: {"ADAUSDT","OGNUSDT", ...}
+_last_fire    = defaultdict(float)   # تبريد per symbol
+_ws           = None
 
-# ===== Utils =====
-def fetch_bitvavo_eur_symbols():
+# للحفاظ على الاستمرارية/الفلترة
+_seen_spread  = {}                   # {symbol: deque[(ts, spread_pct), ...]}
+_dedup_seen   = defaultdict(float)   # {key: ts}
+_alert_bucket = deque()              # timestamps لأخر التنبيهات (rate limit)
+
+# =========================
+# أدوات مساعدة
+# =========================
+def log(*args):
+    print(*args, flush=True)
+
+def post_to_saqr(symbol_base):
+    """إرسال أمر شراء لصقر مباشرة."""
     try:
-        data = requests.get(BITVAVO_MARKETS_URL, timeout=10).json()
-        return {m["market"].split("-")[0].upper()
-                for m in data if m.get("market","").endswith("-EUR")}
+        payload = {"text": f"اشتري {symbol_base}"}
+        r = requests.post(SAQAR_WEBHOOK, json=payload, timeout=10)
+        log(f"📨 SAQAR → {symbol_base} | status={r.status_code} | resp={r.text[:200]}")
     except Exception as e:
-        log("Bitvavo fetch error:", e); return set()
-
-def fetch_binance_exchange_info():
-    data = requests.get(BINANCE_REST_EXINF, timeout=10).json()
-    return {s["symbol"]: s for s in data["symbols"]}
-
-def build_targets():
-    bv = fetch_bitvavo_eur_symbols()
-    ex = fetch_binance_exchange_info()
-    return [b+"USDT" for b in sorted(bv) if (b+"USDT") in ex and ex[b+"USDT"]["status"]=="TRADING"]
-
-import websocket  # pip install websocket-client
-def stream_name(sym): return f"{sym.lower()}@bookTicker"
-
-last_sent_at       = defaultdict(lambda: 0.0)
-global_last_signal = 0.0
-tick_buffers       = defaultdict(lambda: deque(maxlen=CONFIRM_TICKS))
-targets_cache      = []          # للعرض في heartbeat
-ws_connected       = threading.Event()
-
-def usdt_value(p, q):
-    try: return float(p)*float(q)
-    except: return 0.0
-
-def eligible_gap(msg):
-    try:
-        b = float(msg["b"]); a = float(msg["a"])
-        Bq= float(msg.get("B",0)); Aq= float(msg.get("A",0))
-        sym = msg["s"]
-    except Exception:
-        return False, {}
-    if a <= b or a<=0 or b<=0: return False, {}
-    spread_bp = (a/b - 1.0) * 100.0 * 100.0
-    if usdt_value(b,Bq) < MIN_BID_QTY_USDT: return False, {}
-    if usdt_value(a,Aq) < MIN_ASK_QTY_USDT: return False, {}
-    if min(usdt_value(a,1), usdt_value(b,1)) < MIN_NOTIONAL_USDT: return False, {}
-    return spread_bp >= MIN_SPREAD_BP, {"sym": sym, "bid": b, "ask": a, "spread_bp": spread_bp}
-
-def send_to_saqar(base):
-    global global_last_signal
-    now = time.time()
-    if now - global_last_signal < GLOBAL_MIN_INTERVAL_SEC:
-        return False, "global-rate-limit"
-    if now - last_sent_at[base] < PER_SYMBOL_COOLDOWN_SEC:
-        return False, "symbol-cooldown"
-    headers = {}
-    if SAQAR_TOKEN: headers["Authorization"]=f"Bearer {SAQAR_TOKEN}"
-    try:
-        r = requests.post(SAQAR_URL, json={"text": f"اشتري {base}"}, headers=headers, timeout=6)
-        ok = (r.status_code//100==2)
-        last_sent_at[base] = now; global_last_signal = now
-        log(f"📩 SAQAR → {base} | status={r.status_code} | resp={getattr(r,'text','')[:80]}")
-        return ok, r.text
-    except Exception as e:
-        log("SAQAR send error:", e); return False, "send-exception"
-
-def on_message(ws, raw):
-    try:
-        data = json.loads(raw)
-        msg  = data.get("data") or data
-        if not isinstance(msg, dict) or "s" not in msg: return
-        ok, det = eligible_gap(msg)
-        sym = msg["s"]
-        if not ok:
-            tick_buffers[sym].clear()
-            return
-        tick_buffers[sym].append(det["spread_bp"])
-        if len(tick_buffers[sym]) == tick_buffers[sym].maxlen and all(bp>=MIN_SPREAD_BP for bp in tick_buffers[sym]):
-            base = sym[:-4] if sym.endswith("USDT") else sym
-            log(f"⚡ GAP DETECTED {sym}: spread={det['spread_bp']:.3f}bp bid={det['bid']:.6g} ask={det['ask']:.6g}")
-            ok, why = send_to_saqar(base)
-            if not ok and VERBOSE: log(f"↪︎ skipped {base} ({why})")
-            tick_buffers[sym].clear()
-    except Exception as e:
-        log("on_message error:", e); 
-        if VERBOSE: traceback.print_exc()
-
-def on_error(ws, err):  log("WS error:", err)
-def on_close(ws, *_):   log("WS closed — will reconnect")
-
-def open_ws(symbols):
-    streams = "/".join(stream_name(s) for s in symbols)
-    url = BIN_WS_URL + streams
-    ws = websocket.WebSocketApp(url, on_message=on_message, on_error=on_error, on_close=on_close)
-    threading.Thread(target=ws.run_forever, kwargs={"ping_interval":20, "ping_timeout":10}, daemon=True).start()
-    return ws
-
-# ===== عامل الـ Sniper كخيط مستقل (ليعمل تحت gunicorn) =====
-_started = False
-def start_sniper_once():
-    global _started
-    if _started: 
-        return
-    _started = True
-    threading.Thread(target=_sniper_worker, daemon=True).start()
-
-def _sniper_worker():
-    try:
-        log("🚀 Gap Sniper worker booting…")
-        global targets_cache
-        targets_cache = build_targets()
-        log(f"✅ matched symbols: {len(targets_cache)}")
-        log("🎯 " + ", ".join(targets_cache[:30]) + (" …" if len(targets_cache)>30 else ""))
-        open_ws(targets_cache)
-        ws_connected.set()
-        log("🟢 WS started")
-        last_hb = 0
-        while True:
-            time.sleep(1)
-            if time.time()-last_hb >= HEARTBEAT_SEC:
-                last_hb = time.time()
-                log(f"💓 heartbeat | targets={len(targets_cache)} | sent={sum(1 for v in last_sent_at.values() if time.time()-v<3600)} in last hour")
-    except Exception as e:
-        log("SNIPER worker fatal error:", e)
+        log("❌ SAQAR error:", repr(e))
         traceback.print_exc()
-        # حاول إعادة التشغيل بعد قليل
-        time.sleep(5)
-        _sniper_worker()
 
-# ابدأ العامل فور الاستيراد (تحت gunicorn)
-start_sniper_once()
+def midprice(bid, ask):
+    return (bid + ask) / 2.0 if (bid is not None and ask is not None) else None
 
-# ضمان إضافي: إذا تم تعطيل الاستيراد المباشر، شغّله عند أول طلب HTTP
-@app.before_first_request
-def _boot_guard():
-    log("🔥 boot-guard triggered from Flask")
-    start_sniper_once()
+def _push_spread(symbol, spread_pct):
+    q = _seen_spread.get(symbol)
+    if q is None:
+        q = deque(maxlen=64)
+        _seen_spread[symbol] = q
+    q.append((time.time(), spread_pct))
 
-# ===== HTTP للصحة =====
-@app.route("/", methods=["GET"])
+def _sustained(symbol, threshold_pct, window_sec):
+    q = _seen_spread.get(symbol)
+    if not q:
+        return False
+    now = time.time()
+    had = False
+    for ts, sp in q:
+        if ts >= now - window_sec:
+            had = True
+            if sp < threshold_pct:
+                return False
+    return had
+
+def _rate_ok():
+    now = time.time()
+    while _alert_bucket and _alert_bucket[0] < now - 60:
+        _alert_bucket.popleft()
+    return len(_alert_bucket) < MAX_ALERTS_PER_MIN
+
+def _mark_alert():
+    _alert_bucket.append(time.time())
+
+def _dedup(key):
+    now = time.time()
+    last = _dedup_seen.get(key, 0.0)
+    if now - last < DEDUP_WINDOW_SEC:
+        return False
+    _dedup_seen[key] = now
+    return True
+
+def _reject(reason, symbol=None):
+    if DEBUG_REJECTIONS:
+        if symbol:
+            log(f"⏭️  skip {symbol} | {reason}")
+        else:
+            log(f"⏭️  skip | {reason}")
+
+# =========================
+# Bitvavo (قائمة EUR)
+# =========================
+import requests as _req
+def fetch_bitvavo_eur_top():
+    """يرجع مجموعة رموز BASE الموجودة على Bitvavo مقابل EUR (Top N بالأبجدية)."""
+    try:
+        resp = _req.get("https://api.bitvavo.com/v2/markets", timeout=12)
+        data = resp.json()
+        bases = []
+        for m in data:
+            market = m.get("market", "")
+            if market.endswith("-EUR"):
+                base = market.split("-")[0].upper()
+                bases.append(base)
+        # ترتيب ثابت + top N
+        bases = sorted(set(bases))[:TOP_N]
+        log("📊 Top Bitvavo (EUR):", ", ".join(bases))
+        return set(bases)
+    except Exception as e:
+        log("❌ Bitvavo markets error:", repr(e))
+        traceback.print_exc()
+        return set()
+
+# =========================
+# Binance
+# =========================
+def fetch_binance_exchange_info():
+    """نجيب exchangeInfo مرة ونبني مجموعة بالرموز المتاحة."""
+    global _binance_symbols_ok
+    try:
+        url = "https://api.binance.com/api/v3/exchangeInfo"
+        data = requests.get(url, timeout=15).json()
+        ok = set()
+        for s in data.get("symbols", []):
+            if s.get("status") == "TRADING":
+                ok.add(s.get("symbol", ""))
+        _binance_symbols_ok = ok
+        log(f"✅ exchangeInfo loaded: {len(ok)} symbols")
+    except Exception as e:
+        log("❌ exchangeInfo error:", repr(e))
+        traceback.print_exc()
+
+def refresh_targets_loop():
+    """كل SCAN_INTERVAL ثواني: نحدث لائحة العملات المستهدفة من Bitvavo EUR ∩ Binance USDT."""
+    while True:
+        try:
+            bases = fetch_bitvavo_eur_top()
+            with _targets_lock:
+                new_targets = set()
+                for base in bases:
+                    cand = f"{base}USDT"
+                    if cand in _binance_symbols_ok:
+                        new_targets.add(cand)
+                # إن لم يوجد تطابق، لا نُفرغ القائمة القديمة
+                if new_targets:
+                    _targets.clear()
+                    _targets.update(new_targets)
+                    log("🎯 Targets (Binance):", ", ".join(sorted(_targets)))
+                else:
+                    log("⚠️ لا توجد تقاطعات حالياً بين Bitvavo EUR و Binance USDT.")
+        except Exception as e:
+            log("❌ refresh_targets_loop error:", repr(e))
+            traceback.print_exc()
+        time.sleep(SCAN_INTERVAL)
+
+# =========================
+# WebSocket: @bookTicker لكل Target
+# =========================
+def build_stream_url(symbols):
+    # combined stream: /stream?streams=adausdt@bookTicker/btcusdt@bookTicker/...
+    parts = [f"{s.lower()}@bookTicker" for s in symbols]
+    return "wss://stream.binance.com:9443/stream?streams=" + "/".join(parts)
+
+def on_message(ws, message):
+    try:
+        data = json.loads(message)
+        # شكل combined: {"stream":"adausdt@bookTicker","data":{...}}
+        d = data.get("data", {})
+        s = d.get("s")  # SYMBOL
+        if not s:
+            return
+        # فلترة بالtargets
+        with _targets_lock:
+            if s not in _targets:
+                return
+
+        try:
+            bid = float(d.get("b", "0"))
+            ask = float(d.get("a", "0"))
+        except Exception:
+            return
+
+        if bid <= 0 or ask <= 0 or ask <= bid:
+            _reject("bad-topbook", s)
+            return
+
+        mp = midprice(bid, ask)
+        if not mp:
+            return
+
+        spread_pct = (ask - bid) / mp * 100.0     # %
+        # مقارنة مع الإعداد (basis points)
+        min_spread_pct = GAP_SPREAD_BP / 100.0
+        _push_spread(s, spread_pct)
+
+        if spread_pct < min_spread_pct:
+            _reject(f"spread<{min_spread_pct:.2f}%", s)
+            return
+
+        # استمرار
+        if not _sustained(s, min_spread_pct, SUSTAIN_SEC):
+            _reject("not-sustained", s)
+            return
+
+        # سيولة/انحياز (اختياريان لكن مفعلان أعلاه)
+        bqty = float(d.get("B", "0"))  # bestBidQty
+        aqty = float(d.get("A", "0"))  # bestAskQty
+        if bqty > 0 and aqty > 0:
+            bid_usdt = bqty * mp
+            ask_usdt = aqty * mp
+            if bid_usdt < MIN_TOP_QTY_USDT and ask_usdt < MIN_TOP_QTY_USDT:
+                _reject("thin-top", s)
+                return
+            if USE_IMBALANCE:
+                big = max(bid_usdt, ask_usdt)
+                small = max(1e-9, min(bid_usdt, ask_usdt))
+                if big / small < IMB_RATIO_MIN:
+                    _reject("no-imbalance", s)
+                    return
+
+        # تبريد الزوج
+        now = time.time()
+        if now - _last_fire[s] < COOLDOWN_SEC:
+            _reject("pair-cooldown", s)
+            return
+
+        # rate limit عام
+        if not _rate_ok():
+            _reject("rate-limited")
+            return
+
+        # منع التكرار لنفس السبب/القيمة تقريبياً
+        key = f"{s}:{int(spread_pct*1000)}"
+        if not _dedup(key):
+            _reject("dup", s)
+            return
+
+        _mark_alert()
+        _last_fire[s] = now
+
+        base = s.replace("USDT", "")
+        log(f"⚡ GAP DETECTED {s}: spread={spread_pct:.3f}% | bid={bid} ask={ask} | qty(B/A)={bqty:.4f}/{aqty:.4f}")
+        post_to_saqr(base)
+
+    except Exception as e:
+        log("❌ on_message error:", repr(e))
+        traceback.print_exc()
+
+def on_error(ws, error):
+    log("❌ WS error:", error)
+    traceback.print_exc()
+
+def on_close(ws, a, b):
+    log("⚠️ WS closed. code/desc:", a, b)
+
+def on_open(ws):
+    log("🟢 WS opened")
+
+def ws_loop():
+    """يشغّل WS للـ targets الحالية، ويُعيد التشغيل تلقائياً إذا تغيرت."""
+    global _ws
+    current_set = set()
+    while True:
+        try:
+            with _targets_lock:
+                t = sorted(_targets)
+            if not t:
+                time.sleep(3)
+                continue
+
+            # لو تغيرت القائمة نعيد فتح WS
+            if t != sorted(current_set):
+                current_set = set(t)
+                if _ws:
+                    try: _ws.close()
+                    except: pass
+
+                url = build_stream_url(t)
+                log("👁 Starting WS for:", ", ".join(t))
+                _ws = WebSocketApp(
+                    url,
+                    on_open=on_open,
+                    on_message=on_message,
+                    on_error=on_error,
+                    on_close=on_close
+                )
+                # نشغله blocking داخل ثريد منفصل
+                th = threading.Thread(target=_ws.run_forever, kwargs={"ping_interval": 20, "ping_timeout": 10}, daemon=True)
+                th.start()
+
+            time.sleep(5)
+        except Exception as e:
+            log("❌ ws_loop error:", repr(e))
+            traceback.print_exc()
+            time.sleep(5)
+
+# =========================
+# Flask (صحة فقط)
+# =========================
+@app.get("/")
 def health():
-    return "Gap Sniper is alive ✅", 200
+    with _targets_lock:
+        ts = ",".join(sorted(_targets)) or "-"
+    return {
+        "ok": True,
+        "targets": ts,
+        "gap_bp": GAP_SPREAD_BP,
+        "cooldown": COOLDOWN_SEC,
+        "sustain_sec": SUSTAIN_SEC,
+        "min_top_usdt": MIN_TOP_QTY_USDT,
+        "imbalance": USE_IMBALANCE,
+    }
 
-# لو شغّلت الملف محليًا (بدون gunicorn)
+# =========================
+# الإقلاع
+# =========================
+def fetch_binance_symbols_once():
+    fetch_binance_exchange_info()
+
+def boot():
+    log("🚀 Gap Sniper is alive ✅")
+    fetch_binance_symbols_once()
+    threading.Thread(target=refresh_targets_loop, daemon=True).start()
+    threading.Thread(target=ws_loop, daemon=True).start()
+
+boot()
+
 if __name__ == "__main__":
-    start_sniper_once()
-    app.run(host="0.0.0.0", port=PORT)
+    # للركض محلياً: python main.py
+    app.run(host="0.0.0.0", port=8080)
