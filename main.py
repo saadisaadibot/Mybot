@@ -35,7 +35,7 @@ IMB_MIN             = 1.25       # تفوق bids/asks الأدنى المقبو�
 
 # ضغط المشترين (EWMA)
 PRESSURE_ALPHA      = 0.35       # نعومة EWMA
-PRESSURE_TRIG       = 0.55       # عتبة إطلاق: ((bid-ask)/(bid+ask))_EWMA
+PRESSURE_TRIG       = 0.65       # عتبة إطلاق: ((bid-ask)/(bid+ask))_EWMA
 PRESSURE_CLEAR      = 0.20       # لتفريغ الإشارة (hysteresis)
 
 # اتجاه سعري قصير جداً
