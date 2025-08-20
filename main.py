@@ -29,7 +29,7 @@ MAX_ALERTS_PER_MIN  = 12
 SUSTAIN_SEC         = 1.5        # لازم الشروط تبقى ≥ العتبة بهذه المدة
 
 # فلاتر سيولة/سبريد
-SPREAD_MAX_BP       = 35.0       # أقصى سبريد (bp)
+SPREAD_MAX_BP       = 25.0       # أقصى سبريد (bp)
 MIN_BID_USDT        = 1500.0      # حد أدنى سيولة على أفضل Bid
 IMB_MIN             = 1.25       # تفوق bids/asks الأدنى المقبول
 
