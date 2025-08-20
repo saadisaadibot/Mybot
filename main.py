@@ -40,8 +40,8 @@ PRESSURE_CLEAR      = 0.20       # لتفريغ الإشارة (hysteresis)
 
 # اتجاه سعري قصير جداً
 WINDOW_SEC          = 18         # نافذة تحليل upticks/الميل
-UPTICKS_MIN         = 8          # كم مرّة يرتفع أفضل Bid داخل النافذة
-MID_SLOPE_MIN_BP    = 6.0        # ميل midprice (bp) خلال النافذة
+UPTICKS_MIN         = 6          # كم مرّة يرتفع أفضل Bid داخل النافذة
+MID_SLOPE_MIN_BP    = 4.5        # ميل midprice (bp) خلال النافذة
 
 DEBUG_REJECTIONS    = False
 
