@@ -23,7 +23,7 @@ IMB_RATIO_MIN       = 1.6        # (max(bid_usdt, ask_usdt) / min(...)) ≥ 1.6
 # إزالة تكرار + سقف الرسايل
 DEDUP_WINDOW_SEC    = 4.0        # نفس التنبيه لنفس الزوج خلال 4s
 MAX_ALERTS_PER_MIN  = 12         # سقف التنبيهات بالدقيقة
-DEBUG_REJECTIONS    = True       # اطبع سبب الرفض في اللوج
+DEBUG_REJECTIONS    = False       # اطبع سبب الرفض في اللوج
 
 # =========================
 # متغيرات داخلية
