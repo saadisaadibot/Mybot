@@ -358,7 +358,7 @@ def health():
 # =========================
 # الإقلاع
 # =========================
-def boot():
+#def boot():
     log("🚀 Accumulation Sniper is alive ✅")
     fetch_binance_exchange_info()
     threading.Thread(target=refresh_targets_loop, daemon=True).start()
